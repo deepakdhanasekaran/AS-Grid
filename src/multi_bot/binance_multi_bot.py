@@ -7,9 +7,11 @@ import hashlib
 import time
 import ccxt
 import math
+from collections import deque
 from decimal import Decimal, ROUND_HALF_UP
 import os
 from dotenv import load_dotenv
+from typing import Optional
 import aiohttp
 
 # Load environment variables
@@ -273,6 +275,271 @@ class BinanceGridBot:
         except Exception as e:
             logger.error(f"Failed to persist lockdown exit: {e}", exc_info=True)
 
+    def _config_float(self, key: str, default: float) -> float:
+        try:
+            return float(self.config.get(key, default))
+        except Exception:
+            return float(default)
+
+    def _config_int(self, key: str, default: int) -> int:
+        try:
+            return int(float(self.config.get(key, default)))
+        except Exception:
+            return int(default)
+
+    def _compute_min_profitable_grid_spacing(self) -> float:
+        """Estimate the minimum grid spacing needed to cover fees, funding, and a small profit buffer."""
+        maker_fee = self._config_float("maker_fee_rate", 0.0002)
+        taker_fee = self._config_float("taker_fee_rate", 0.0005)
+        funding_buffer = self._config_float("funding_buffer_rate", 0.0003)
+        min_net_edge = self._config_float("min_net_edge_rate", 0.0010)
+        round_trip_fee_floor = max(2.0 * maker_fee, 2.0 * taker_fee)
+        return round_trip_fee_floor + funding_buffer + min_net_edge
+
+    def _init_market_guard(self):
+        """Initialize fee-aware range guard settings and runtime state."""
+        self.maker_fee_rate = self._config_float("maker_fee_rate", 0.0002)
+        self.taker_fee_rate = self._config_float("taker_fee_rate", 0.0005)
+        self.funding_buffer_rate = self._config_float("funding_buffer_rate", 0.0003)
+        self.min_net_edge_rate = self._config_float("min_net_edge_rate", 0.0010)
+        self.max_spread_rate = self._config_float("max_spread_rate", 0.0010)
+        self.range_filter_lookback = max(1, self._config_int("range_filter_lookback", 60))
+        self.range_min_samples = min(
+            self.range_filter_lookback,
+            max(1, self._config_int("range_min_samples", max(20, self.range_filter_lookback // 3))),
+        )
+        self.range_pause_seconds = max(1, self._config_int("range_pause_seconds", 300))
+        self.min_compression_range_rate = self._config_float(
+            "range_min_pct",
+            max(self._compute_min_profitable_grid_spacing() * 2.0, self.grid_spacing * 0.5, 0.002),
+        )
+        self.breakout_range_rate = self._config_float(
+            "range_breakout_pct",
+            max(self.grid_spacing * 2.5, self._compute_min_profitable_grid_spacing() * 4.0, 0.008),
+        )
+        self.min_profitable_grid_spacing = self._compute_min_profitable_grid_spacing()
+        self._market_guard_static_block = self.grid_spacing < self.min_profitable_grid_spacing
+        self._market_guard_static_reason = "grid_too_tight" if self._market_guard_static_block else None
+        self._market_guard_static_block_ts = time.time() if self._market_guard_static_block else 0.0
+        self._price_window = deque(maxlen=self.range_filter_lookback)
+        self._market_guard_paused = False
+        self._market_guard_reason = None
+        self._market_guard_pause_until_ts = 0.0
+        self._market_guard_last_transition_ts = 0.0
+        self._market_guard_last_notification_state = None
+        self._market_guard_last_log_ts = 0.0
+
+    def _log_market_guard_startup(self):
+        """Log the computed profitability floor and the configured guard thresholds."""
+        logger.info(
+            "Fee-aware guard initialized: min profitable grid spacing %.3f%%, configured grid spacing %.3f%%, "
+            "range floor %.3f%%, breakout %.3f%%, max spread %.3f%%",
+            self.min_profitable_grid_spacing * 100.0,
+            self.grid_spacing * 100.0,
+            self.min_compression_range_rate * 100.0,
+            self.breakout_range_rate * 100.0,
+            self.max_spread_rate * 100.0,
+        )
+        if self._market_guard_static_block:
+            logger.warning(
+                "Configured grid spacing %.3f%% is below the fee-aware floor %.3f%%; new entries will stay paused until the grid is widened",
+                self.grid_spacing * 100.0,
+                self.min_profitable_grid_spacing * 100.0,
+            )
+
+    def _append_price_sample(self, price: float):
+        """Append a price sample for the range filter."""
+        try:
+            if price is not None and float(price) > 0:
+                self._price_window.append(float(price))
+        except Exception:
+            pass
+
+    def _calculate_market_regime_metrics(self, bid=None, ask=None):
+        """Calculate recent range and trend metrics from the rolling price window."""
+        prices = [float(p) for p in self._price_window if p is not None and float(p) > 0]
+        metrics = {
+            "sample_count": len(prices),
+            "range_pct": 0.0,
+            "direction_pct": 0.0,
+            "spread_pct": None,
+            "high": None,
+            "low": None,
+            "first": None,
+            "last": None,
+            "mid": None,
+        }
+
+        if not prices:
+            return metrics
+
+        high = max(prices)
+        low = min(prices)
+        mid = (high + low) / 2.0 if (high + low) else 0.0
+        first = prices[0]
+        last = prices[-1]
+
+        metrics.update({
+            "high": high,
+            "low": low,
+            "first": first,
+            "last": last,
+            "mid": mid,
+            "range_pct": ((high - low) / mid) if mid else 0.0,
+            "direction_pct": (abs(last - first) / mid) if mid else 0.0,
+        })
+
+        try:
+            if bid is not None and ask is not None and mid:
+                bid = float(bid)
+                ask = float(ask)
+                if ask > bid:
+                    metrics["spread_pct"] = (ask - bid) / mid
+        except Exception:
+            metrics["spread_pct"] = None
+
+        return metrics
+
+    def _update_market_guard_state(self, price=None, bid=None, ask=None):
+        """Update the market-regime pause state and return transition metadata."""
+        if self._market_guard_static_block:
+            return {
+                "changed": False,
+                "paused": True,
+                "reason": self._market_guard_static_reason,
+                "warming_up": False,
+                "metrics": {
+                    "sample_count": len(self._price_window),
+                    "range_pct": 0.0,
+                    "direction_pct": 0.0,
+                    "spread_pct": None,
+                    "high": None,
+                    "low": None,
+                    "first": None,
+                    "last": None,
+                    "mid": None,
+                },
+            }
+
+        if price is not None:
+            self._append_price_sample(price)
+
+        metrics = self._calculate_market_regime_metrics(bid=bid, ask=ask)
+        now = time.time()
+
+        if metrics["sample_count"] < self.range_min_samples:
+            return {
+                "changed": False,
+                "paused": self._market_guard_paused,
+                "reason": self._market_guard_reason,
+                "warming_up": True,
+                "metrics": metrics,
+            }
+
+        reasons = []
+        spread_pct = metrics.get("spread_pct")
+        if spread_pct is not None and spread_pct > self.max_spread_rate:
+            reasons.append("spread_too_wide")
+
+        if metrics["range_pct"] < self.min_compression_range_rate:
+            reasons.append("range_too_compressed")
+
+        if metrics["direction_pct"] > self.breakout_range_rate:
+            reasons.append("directional_breakout")
+
+        changed = False
+        reason = ",".join(reasons) if reasons else None
+
+        if reasons:
+            if (not self._market_guard_paused) or (reason != self._market_guard_reason):
+                changed = True
+                self._market_guard_paused = True
+                self._market_guard_reason = reason
+                self._market_guard_pause_until_ts = now + self.range_pause_seconds
+                self._market_guard_last_transition_ts = now
+            else:
+                self._market_guard_pause_until_ts = max(
+                    self._market_guard_pause_until_ts,
+                    now + self.range_pause_seconds,
+                )
+        else:
+            if self._market_guard_paused and now >= self._market_guard_pause_until_ts:
+                changed = True
+                self._market_guard_paused = False
+                self._market_guard_reason = None
+                self._market_guard_last_transition_ts = now
+
+        return {
+            "changed": changed,
+            "paused": self._market_guard_paused,
+            "reason": self._market_guard_reason,
+            "warming_up": False,
+            "metrics": metrics,
+        }
+
+    def _can_open_new_entries(self) -> bool:
+        """Return True when new entries are allowed."""
+        return (
+            not self._day_fuse_on
+            and not self._emg_in_progress
+            and time.time() >= self._grid_pause_until_ts
+            and not self._market_guard_paused
+            and not self._market_guard_static_block
+        )
+
+    def _log_pending_entry_status(self, side: str, remaining: float):
+        """Throttle logs for pending initial entries."""
+        last_log_ts = self._pending_entry_log_ts.get(side, 0.0)
+        now = time.time()
+        if now - last_log_ts >= 15:
+            self._pending_entry_log_ts[side] = now
+            logger.info(f"Skipping {side} entry because a previous order is still pending ({remaining:.0f}s remaining)")
+
+    async def _notify_market_guard_transition(self, transition: dict):
+        """Send a Telegram notification when the fee/range guard changes state."""
+        if not transition or not transition.get("changed"):
+            return
+
+        paused = transition.get("paused", False)
+        reason = transition.get("reason") or "unknown"
+        metrics = transition.get("metrics", {})
+        range_pct = metrics.get("range_pct", 0.0) * 100.0
+        direction_pct = metrics.get("direction_pct", 0.0) * 100.0
+        spread_pct = metrics.get("spread_pct")
+        spread_text = f"{spread_pct * 100.0:.3f}%" if spread_pct is not None else "n/a"
+
+        if paused:
+            message = f"""
+⏸️ **New entries paused**
+
+📊 **Market guard**
+• Symbol: {self.symbol}
+• Reason: {reason}
+• Recent range: {range_pct:.3f}%
+• Directional move: {direction_pct:.3f}%
+• Spread: {spread_text}
+
+🛡️ **Protection**
+• Fees, funding, or breakout conditions no longer support fresh grid entries
+• Existing reduce-only exits remain active
+"""
+        else:
+            message = f"""
+▶️ **New entries resumed**
+
+📊 **Market guard**
+• Symbol: {self.symbol}
+• Reason cleared: {reason}
+• Recent range: {range_pct:.3f}%
+• Directional move: {direction_pct:.3f}%
+• Spread: {spread_text}
+
+✅ **Trading state**
+• Market conditions are back inside the configured guard rails
+"""
+
+        await self._send_telegram_message(message, urgent=paused, silent=not paused)
+
     def __init__(self, symbol, api_key, api_secret, config):
         """
         初始化 BinanceGridBot
@@ -298,16 +565,18 @@ class BinanceGridBot:
         self.initial_quantity = config.get('initial_quantity', 3)
         self.leverage = config.get('leverage', 20)
         self.contract_type = config.get('contract_type', 'USDT')
+        self.ccxt_symbol = f"{symbol.replace('USDT', '').replace('USDC', '')}/{self.contract_type}:{self.contract_type}"
         
         # 计算阈值
         self.position_threshold_factor = float(self.config.get('position_threshold_factor', 10))
         self.position_limit_factor = float(self.config.get('position_limit_factor', 5))
         self.position_threshold = self.position_threshold_factor * self.initial_quantity / self.grid_spacing * 2 / 100
         self.position_limit = self.position_limit_factor * self.initial_quantity / self.grid_spacing * 2 / 100
+        self._market_guard_static_block = False
+        self._market_guard_static_reason = None
         
         # 初始化交易所
         self.exchange = self._init_exchange()
-        self.ccxt_symbol = f"{symbol.replace('USDT', '').replace('USDC', '')}/{self.contract_type}:{self.contract_type}"
         
         # 获取价格精度
         self._get_price_precision()
@@ -333,7 +602,6 @@ class BinanceGridBot:
 
 
 
-        from collections import deque
         self._vol_prices = deque(maxlen=60)
 
         self.long_initial_quantity = 0
@@ -342,6 +610,15 @@ class BinanceGridBot:
         self.short_position = 0
         self.last_long_order_time = 0
         self.last_short_order_time = 0
+        self.long_entry_pending = False
+        self.short_entry_pending = False
+        self.entry_pending_timeout_s = int(self.config.get('entry_pending_timeout_s', 180))
+        self.open_orders_backoff_s = int(self.config.get('open_orders_backoff_s', 30))
+        self._open_orders_last_failure_ts = 0.0
+        self._order_sync_skip_log_ts = 0.0
+        self._last_no_position_log_ts = 0.0
+        self._pending_entry_log_ts = {'long': 0.0, 'short': 0.0}
+        self._market_guard_last_cleanup_ts = 0.0
         self.buy_long_orders = 0.0
         self.sell_long_orders = 0.0
         self.sell_short_orders = 0.0
@@ -377,6 +654,9 @@ class BinanceGridBot:
         # 双倍止盈止损通知状态跟踪
         self.long_double_profit_alerted = False
         self.short_double_profit_alerted = False
+
+        # Fee-aware range guard configuration and state
+        self._init_market_guard()
         
         # 初始化异步锁（延迟创建，避免在没有事件循环时创建）
         self.lock = None
@@ -392,6 +672,7 @@ class BinanceGridBot:
 
     def _init_exchange(self):
         """初始化交易所 API"""
+        use_demo_trading = os.getenv("BINANCE_DEMO_TRADING", os.getenv("BINANCE_SANDBOX", "false")).lower() == "true"
         exchange = CustomBinance({
             "apiKey": self.api_key,
             "secret": self.api_secret,
@@ -399,10 +680,34 @@ class BinanceGridBot:
                 "defaultType": "future",
             },
         })
-        if self.binance_sandbox:
-            exchange.setSandboxMode(True)
-            logger.info("Binance Sandbox/Demo mode enabled")
+        if use_demo_trading:
+            try:
+                if hasattr(exchange, "enable_demo_trading"):
+                    exchange.enable_demo_trading(True)
+                elif hasattr(exchange, "enableDemoTrading"):
+                    exchange.enableDemoTrading(True)
+                else:
+                    raise AttributeError("CCXT version does not support Binance demo trading helpers")
+                logger.info("Binance Demo Trading mode enabled")
+            except Exception as e:
+                logger.error(
+                    "Failed to enable Binance Demo Trading mode. For futures, CCXT no longer supports sandbox/testnet; "
+                    "you need Binance Demo Trading API keys and a recent CCXT build.",
+                    exc_info=True,
+                )
+                raise e
         exchange.load_markets(reload=False)
+        try:
+            exchange.set_leverage(self.leverage, self.ccxt_symbol)
+            logger.info(f"Leverage set to {self.leverage}x for {self.ccxt_symbol}")
+        except AttributeError:
+            try:
+                exchange.setLeverage(self.leverage, self.ccxt_symbol)
+                logger.info(f"Leverage set to {self.leverage}x for {self.ccxt_symbol}")
+            except Exception as e:
+                logger.warning(f"Unable to set leverage automatically: {e}")
+        except Exception as e:
+            logger.warning(f"Unable to set leverage automatically: {e}")
         return exchange
 
     def _get_price_precision(self):
@@ -430,9 +735,70 @@ class BinanceGridBot:
 
         # 获取最小下单数量
         self.min_order_amount = symbol_info["limits"]["amount"]["min"]
+        cost_limits = symbol_info.get("limits", {}).get("cost", {}) or {}
+        self.min_order_notional = cost_limits.get("min") or 50.0
 
         logger.info(
-            f"Price precision: {self.price_precision}, amount precision: {self.amount_precision}, minimum order size: {self.min_order_amount}")
+            f"Price precision: {self.price_precision}, amount precision: {self.amount_precision}, minimum order size: {self.min_order_amount}, minimum notional: {self.min_order_notional}")
+
+    def _round_quantity_up(self, quantity: float) -> float:
+        """Round quantity up to the configured amount precision."""
+        factor = 10 ** self.amount_precision
+        return math.ceil(float(quantity) * factor) / factor
+
+    def _get_entry_quantity(self, price, requested_quantity: float) -> float:
+        """Return a Binance-compliant entry quantity for non-reduce-only orders."""
+        quantity = max(float(requested_quantity), float(self.min_order_amount))
+
+        reference_price = None
+        try:
+            if price is not None:
+                reference_price = float(price)
+            elif self.latest_price:
+                reference_price = float(self.latest_price)
+            elif self.best_bid_price:
+                reference_price = float(self.best_bid_price)
+            elif self.best_ask_price:
+                reference_price = float(self.best_ask_price)
+        except Exception:
+            reference_price = None
+
+        if reference_price and reference_price > 0:
+            min_quantity_by_notional = float(self.min_order_notional) / reference_price
+            quantity = max(quantity, min_quantity_by_notional)
+
+        adjusted_quantity = self._round_quantity_up(quantity)
+        if adjusted_quantity > requested_quantity:
+            logger.warning(
+                f"Entry quantity increased to meet Binance minimums: requested={requested_quantity}, adjusted={adjusted_quantity}, "
+                f"min_amount={self.min_order_amount}, min_notional={self.min_order_notional}")
+        return adjusted_quantity
+
+    def _get_reduce_only_quantity(self, side: str, requested_quantity: float) -> Optional[float]:
+        """Clamp reduce-only quantity to the live position so Binance will accept it."""
+        live_position = self.long_position if side == 'long' else self.short_position
+        if live_position is None:
+            return None
+
+        try:
+            live_position = abs(float(live_position))
+            requested_quantity = float(requested_quantity)
+        except Exception:
+            return None
+
+        if live_position <= 0:
+            return None
+
+        if live_position < self.min_order_amount:
+            logger.warning(
+                f"Skipping {side} reduce-only order because the live position {live_position} is below the Binance minimum amount "
+                f"{self.min_order_amount}")
+            return None
+
+        quantity = min(requested_quantity, live_position)
+        quantity = round(quantity, self.amount_precision)
+
+        return quantity
 
     def _get_position(self):
         """获取当前持仓"""
@@ -574,6 +940,11 @@ class BinanceGridBot:
 🛡️ **Risk controls**
 • Lockdown threshold: {self.position_threshold:.2f}
 • Position monitoring threshold: {self.position_limit:.2f}
+
+🧮 **Fee-aware guard**
+• Minimum profitable grid spacing: {self.min_profitable_grid_spacing:.2%}
+• Market regime filter: {'paused' if self._market_guard_paused or self._market_guard_static_block else 'active'}
+• Guard reason: {self._market_guard_reason or self._market_guard_static_reason or 'none'}
 
 ✅ The bot is running and will trade automatically...
 """
@@ -832,7 +1203,13 @@ Please check the bot status...
 
     def _check_orders_status(self):
         """Check current order state and update long/short order counts"""
-        orders = self.exchange.fetch_open_orders(symbol=self.ccxt_symbol)
+        orders = self._safe_fetch_open_orders()
+        if orders is None:
+            now = time.time()
+            if now - self._order_sync_skip_log_ts >= self.open_orders_backoff_s:
+                self._order_sync_skip_log_ts = now
+                logger.warning("Order sync skipped; keeping last known order state")
+            return
 
         buy_long_orders = 0.0
         sell_long_orders = 0.0
@@ -857,6 +1234,25 @@ Please check the bot status...
         self.sell_long_orders = sell_long_orders
         self.buy_short_orders = buy_short_orders
         self.sell_short_orders = sell_short_orders
+
+    def _safe_fetch_open_orders(self, symbol=None):
+        """Fetch open orders and degrade gracefully when Binance demo returns transient errors.
+
+        Returns:
+            list | None: Open orders on success, or None when the exchange request fails.
+        """
+        try:
+            if symbol is None:
+                symbol = self.ccxt_symbol
+            if self._open_orders_last_failure_ts:
+                elapsed = time.time() - self._open_orders_last_failure_ts
+                if elapsed < self.open_orders_backoff_s:
+                    return None
+            return self.exchange.fetch_open_orders(symbol=symbol)
+        except Exception as e:
+            self._open_orders_last_failure_ts = time.time()
+            logger.warning(f"Failed to fetch open orders for {symbol}; skipping order-state dependent logic: {e}")
+            return None
 
     async def _keep_listen_key_alive(self):
         """定期更新 listenKey"""
@@ -940,19 +1336,43 @@ Please check the bot status...
                 self.best_bid_price = float(best_bid_price)
                 self.best_ask_price = float(best_ask_price)
                 self.latest_price = (self.best_bid_price + self.best_ask_price) / 2
+                guard_transition = self._update_market_guard_state(
+                    price=self.latest_price,
+                    bid=self.best_bid_price,
+                    ask=self.best_ask_price,
+                )
+                if guard_transition.get("changed"):
+                    await self._notify_market_guard_transition(guard_transition)
             except ValueError as e:
                 logger.error(f"Failed to parse price: {e}")
 
             if time.time() - self.last_position_update_time > SYNC_TIME:
-                self.long_position, self.short_position = self._get_position()
-                self.last_position_update_time = time.time()
+                try:
+                    self.long_position, self.short_position = self._get_position()
+                    self.last_position_update_time = time.time()
+                    if self.long_position > 0:
+                        self.long_entry_pending = False
+                    if self.short_position > 0:
+                        self.short_entry_pending = False
+                except Exception as e:
+                    logger.warning(f"Position sync failed; keeping last known positions: {e}")
 
             if time.time() - self.last_orders_update_time > SYNC_TIME:
-                self._check_orders_status()
-                self.last_orders_update_time = time.time()
+                try:
+                    self._check_orders_status()
+                    self.last_orders_update_time = time.time()
+                except Exception as e:
+                    logger.warning(f"Order sync failed; keeping last known order state: {e}")
 
-            await self._grid_loop()
-            await self._send_summary_notification()
+            try:
+                await self._grid_loop()
+            except Exception as e:
+                logger.error(f"Grid loop failed during ticker processing: {e}", exc_info=True)
+
+            try:
+                await self._send_summary_notification()
+            except Exception as e:
+                logger.warning(f"Summary notification failed; continuing: {e}")
 
     async def _handle_order_update(self, message):
         """Process order and position updates"""
@@ -1005,6 +1425,7 @@ Please check the bot status...
                         if side == "BUY":
                             if position_side == "LONG":
                                 self.buy_long_orders = max(0.0, self.buy_long_orders - quantity)
+                                self.long_entry_pending = False
                             elif position_side == "SHORT":
                                 self.buy_short_orders = max(0.0, self.buy_short_orders - quantity)
                         elif side == "SELL":
@@ -1012,6 +1433,12 @@ Please check the bot status...
                                 self.sell_long_orders = max(0.0, self.sell_long_orders - quantity)
                             elif position_side == "SHORT":
                                 self.sell_short_orders = max(0.0, self.sell_short_orders - quantity)
+                                self.short_entry_pending = False
+                    elif status in ("FILLED", "EXPIRED", "REJECTED"):
+                        if side == "BUY" and position_side == "LONG" and not reduce_only:
+                            self.long_entry_pending = False
+                        elif side == "SELL" and position_side == "SHORT" and not reduce_only:
+                            self.short_entry_pending = False
 
     def _get_take_profit_quantity(self, position, side):
         """Adjust take-profit order quantity"""
@@ -1034,13 +1461,23 @@ Please check the bot status...
     async def _initialize_long_orders(self):
         """初始化多头挂单"""
         current_time = time.time()
-        if current_time - self.last_long_order_time < ORDER_FIRST_TIME:
-            logger.info(f"Skipping long order placement because only {ORDER_FIRST_TIME} second(s) have passed since the last attempt")
+        if self.long_entry_pending and current_time - self.last_long_order_time < self.entry_pending_timeout_s:
+            remaining = self.entry_pending_timeout_s - (current_time - self.last_long_order_time)
+            logger.info(f"Skipping long entry because a previous order is still pending ({remaining:.0f}s remaining)")
+            return
+        if current_time - self.last_long_order_time < ORDER_COOLDOWN_TIME:
+            remaining = ORDER_COOLDOWN_TIME - (current_time - self.last_long_order_time)
+            logger.info(f"Skipping long order placement because only {remaining:.0f}s remain in the entry cooldown")
             return
 
-        self._cancel_orders_for_side('long')
-        self._place_order('buy', self.best_bid_price, self.initial_quantity, False, 'long')
-        logger.info(f"Placed long entry order: buy @ {self.latest_price}")
+        if not self._cancel_orders_for_side('long'):
+            logger.warning("Long open orders could not be verified; placing entry cautiously without cleanup")
+        order = self._place_order('buy', self.best_bid_price, self.initial_quantity, False, 'long')
+        if order:
+            self.long_entry_pending = True
+            logger.info(f"Placed long entry order: buy @ {self.latest_price}")
+        else:
+            logger.warning("Long entry order was rejected by Binance; will retry on the next cycle")
 
         self.last_long_order_time = time.time()
         logger.info("Long order initialization complete")
@@ -1048,20 +1485,33 @@ Please check the bot status...
     async def _initialize_short_orders(self):
         """初始化空头挂单"""
         current_time = time.time()
-        if current_time - self.last_short_order_time < ORDER_FIRST_TIME:
-            logger.info(f"Skipping short order placement because only {ORDER_FIRST_TIME} second(s) have passed since the last attempt")
+        if self.short_entry_pending and current_time - self.last_short_order_time < self.entry_pending_timeout_s:
+            remaining = self.entry_pending_timeout_s - (current_time - self.last_short_order_time)
+            logger.info(f"Skipping short entry because a previous order is still pending ({remaining:.0f}s remaining)")
+            return
+        if current_time - self.last_short_order_time < ORDER_COOLDOWN_TIME:
+            remaining = ORDER_COOLDOWN_TIME - (current_time - self.last_short_order_time)
+            logger.info(f"Skipping short order placement because only {remaining:.0f}s remain in the entry cooldown")
             return
 
-        self._cancel_orders_for_side('short')
-        self._place_order('sell', self.best_ask_price, self.initial_quantity, False, 'short')
-        logger.info(f"Placed short entry order: sell @ {self.latest_price}")
+        if not self._cancel_orders_for_side('short'):
+            logger.warning("Short open orders could not be verified; placing entry cautiously without cleanup")
+        order = self._place_order('sell', self.best_ask_price, self.initial_quantity, False, 'short')
+        if order:
+            self.short_entry_pending = True
+            logger.info(f"Placed short entry order: sell @ {self.latest_price}")
+        else:
+            logger.warning("Short entry order was rejected by Binance; will retry on the next cycle")
 
         self.last_short_order_time = time.time()
         logger.info("Short order initialization complete")
 
     def _cancel_orders_for_side(self, position_side):
         """撤销某个方向的所有挂单"""
-        orders = self.exchange.fetch_open_orders(self.ccxt_symbol)
+        orders = self._safe_fetch_open_orders(self.ccxt_symbol)
+
+        if orders is None:
+            return False
 
         if len(orders) == 0:
             logger.info("No open orders found")
@@ -1088,6 +1538,7 @@ Please check the bot status...
                 self._check_orders_status()
             except Exception as e:
                 logger.error(f"Failed to cancel orders: {e}")
+        return True
 
     def _cancel_order(self, order_id):
         """撤单"""
@@ -1096,11 +1547,57 @@ Please check the bot status...
         except ccxt.BaseError as e:
             logger.error(f"Failed to cancel order: {e}")
 
+    def _adjust_limit_price_for_maker(self, side, price, is_reduce_only=False):
+        """Keep limit orders on the maker side when the book is available."""
+        try:
+            price = float(price)
+            tick_size = 10 ** (-max(0, int(self.price_precision)))
+            best_bid = float(self.best_bid_price) if self.best_bid_price else None
+            best_ask = float(self.best_ask_price) if self.best_ask_price else None
+
+            if side == 'buy':
+                reference_price = best_bid or best_ask
+                if reference_price is None:
+                    return price
+                safe_price = reference_price - tick_size
+                if safe_price <= 0:
+                    return None
+                if price >= reference_price:
+                    adjusted_price = min(price, safe_price)
+                    if adjusted_price != price:
+                        logger.info(
+                            f"Adjusted buy limit price to remain maker-side: requested={price}, adjusted={adjusted_price}, "
+                            f"best_bid={best_bid}, best_ask={best_ask}, reduce_only={is_reduce_only}")
+                    return adjusted_price
+                return price
+
+            if side == 'sell':
+                reference_price = best_ask or best_bid
+                if reference_price is None:
+                    return price
+                safe_price = reference_price + tick_size
+                if price <= reference_price:
+                    adjusted_price = max(price, safe_price)
+                    if adjusted_price != price:
+                        logger.info(
+                            f"Adjusted sell limit price to remain maker-side: requested={price}, adjusted={adjusted_price}, "
+                            f"best_bid={best_bid}, best_ask={best_ask}, reduce_only={is_reduce_only}")
+                    return adjusted_price
+                return price
+
+            return price
+        except Exception as e:
+            logger.warning(f"Unable to apply maker-side price guard; using original limit price: {e}")
+            return price
+
     def _place_order(self, side, price, quantity, is_reduce_only=False, position_side=None, order_type='limit'):
         """挂单函数"""
         try:
-            quantity = round(quantity, self.amount_precision)
-            quantity = max(quantity, self.min_order_amount)
+            if is_reduce_only:
+                quantity = round(float(quantity), self.amount_precision)
+                quantity = max(quantity, self.min_order_amount)
+            else:
+                quantity = self._get_entry_quantity(price, quantity)
 
             import uuid
             client_order_id = f"x-TBzTen1X-{uuid.uuid4().hex[:8]}"
@@ -1120,6 +1617,11 @@ Please check the bot status...
                     return None
 
                 price = round(price, self.price_precision)
+                maker_price = self._adjust_limit_price_for_maker(side, price, is_reduce_only)
+                if maker_price is None:
+                    logger.warning(f"Skipping {side} limit order because the book does not allow a maker-side price")
+                    return None
+                price = round(maker_price, self.price_precision)
 
                 params = {
                     'newClientOrderId': client_order_id,
@@ -1138,9 +1640,18 @@ Please check the bot status...
         """挂止盈单"""
         # 先按精度 round
         price = round(float(price), self.price_precision)
+        maker_side = 'sell' if side == 'long' else 'buy'
+        maker_price = self._adjust_limit_price_for_maker(maker_side, price, True)
+        if maker_price is None:
+            logger.warning(f"Skipping {side} take-profit placement because the book does not allow a maker-side price")
+            return
+        price = round(float(maker_price), self.price_precision)
 
         # 如果已有"同价位"的止盈单则跳过（使用 round 后的严格相等判断）
-        orders = self.exchange.fetch_open_orders(ccxt_symbol)
+        orders = self._safe_fetch_open_orders(ccxt_symbol)
+        if orders is None:
+            logger.warning(f"Skipping {side} take-profit placement because open orders could not be verified")
+            return
         for order in orders:
             pos = order['info'].get('positionSide')
             s = order['side']
@@ -1157,15 +1668,12 @@ Please check the bot status...
                 return
 
         try:
-            if side == 'long' and self.long_position <= 0:
-                logger.warning("No long position available; skipping long take-profit order")
-                return
-            elif side == 'short' and self.short_position <= 0:
-                logger.warning("No short position available; skipping short take-profit order")
+            adjusted_quantity = self._get_reduce_only_quantity(side, quantity)
+            if adjusted_quantity is None:
+                logger.warning(f"No {side} position available; skipping {side} take-profit order")
                 return
 
-            qty = round(float(quantity), self.amount_precision)
-            qty = max(qty, self.min_order_amount)
+            qty = adjusted_quantity
             if side == 'long':
                 import uuid
                 client_order_id = f"x-TBzTen1X-{uuid.uuid4().hex[:8]}"
@@ -1189,7 +1697,7 @@ Please check the bot status...
             logger.error(f"Failed to place take-profit order: {e}")
 
     # ===== 核心：多头下单逻辑（修复：只加倍止盈、不加倍补仓；装死限幅；下单后更新冷却时间）=====
-    async def _place_long_orders(self, latest_price):
+    async def _place_long_orders(self, latest_price, allow_new_entries=True):
         """Place long orders"""
         try:
             # 根据当前持仓情况动态调整多头下单数量（可能翻倍）
@@ -1236,23 +1744,40 @@ Please check the bot status...
                     if self.lockdown_mode['long']['active']:
                         self._exit_lockdown_fixed('long', '仓位回落')
                         logger.info("Long exited lockdown mode and resumed normal trading")
-                    
+
+                    existing_tp = self._get_existing_tp_order('long')
+                    if not allow_new_entries and existing_tp is not None:
+                        now = time.time()
+                        if now - getattr(self, '_market_guard_last_log_ts', 0.0) >= 30:
+                            self._market_guard_last_log_ts = now
+                            logger.info("Long take-profit already exists; market guard keeps it unchanged")
+                        return
+
                     self._update_mid_price('long', latest_price)
-                    self._cancel_open_orders_for_side('long')
 
-                    # 止盈（可能重挂）：用 long_initial_quantity（可能=2*initial_quantity）
-                    placed_any |= self._ensure_take_profit_at(
-                        side='long',
-                        target_price=self.upper_price_long,
-                        quantity=self.long_initial_quantity,
-                        tol_ratio=max(self.grid_spacing * 0.2, 0.001),
-                    )
+                    # 止盈：正常模式下允许随中线重挂；暂停模式下只保持现有止盈，不频繁改价
+                    if allow_new_entries or existing_tp is None:
+                        placed_any |= self._ensure_take_profit_at(
+                            side='long',
+                            target_price=self.upper_price_long,
+                            quantity=self.long_initial_quantity,
+                            tol_ratio=max(self.grid_spacing * 0.2, 0.001),
+                        )
+                    elif existing_tp:
+                        logger.info("Long take-profit already exists; market guard keeps it unchanged")
 
-                    # 补仓：始终使用基础数量 initial_quantity，而不是"加倍后"的 long_initial_quantity
-                    open_qty = max(self.min_order_amount, round(self.initial_quantity, self.amount_precision))
-                    if self._place_order('buy', self.lower_price_long, open_qty, False, 'long'):
-                        placed_any = True
-                    logger.info("Placed long take-profit and long entry orders")
+                    if allow_new_entries:
+                        # 补仓：始终使用基础数量 initial_quantity，而不是"加倍后"的 long_initial_quantity
+                        placed_any |= self._ensure_entry_order_at(
+                            side='long',
+                            target_price=self.lower_price_long,
+                            quantity=self.initial_quantity,
+                            tol_ratio=max(self.grid_spacing * 0.2, 0.001),
+                        )
+                        if placed_any:
+                            logger.info("Placed long take-profit and long entry orders")
+                    else:
+                        logger.info("Long new entries are paused by the market guard; keeping take-profit orders only")
 
                 # 若本轮确实有挂出新单/重挂，则更新冷却时间戳
                 if placed_any:
@@ -1261,7 +1786,7 @@ Please check the bot status...
         except Exception as e:
             logger.error(f"Failed to place long orders: {e}")
 
-    async def _place_short_orders(self, latest_price):
+    async def _place_short_orders(self, latest_price, allow_new_entries=True):
         """Place short orders"""
         try:
             # 根据当前持仓情况动态调整空头下单数量（可能翻倍）
@@ -1307,21 +1832,38 @@ Please check the bot status...
                     if self.lockdown_mode['short']['active']:
                         self._exit_lockdown_fixed('short', '仓位回落')
                         logger.info("Short exited lockdown mode and resumed normal trading")
-                    
+
+                    existing_tp = self._get_existing_tp_order('short')
+                    if not allow_new_entries and existing_tp is not None:
+                        now = time.time()
+                        if now - getattr(self, '_market_guard_last_log_ts', 0.0) >= 30:
+                            self._market_guard_last_log_ts = now
+                            logger.info("Short take-profit already exists; market guard keeps it unchanged")
+                        return
+
                     self._update_mid_price('short', latest_price)
-                    self._cancel_open_orders_for_side('short')
 
-                    placed_any |= self._ensure_take_profit_at(
-                        side='short',
-                        target_price=self.lower_price_short,
-                        quantity=self.short_initial_quantity,
-                        tol_ratio=max(self.grid_spacing * 0.2, 0.001),
-                    )
+                    if allow_new_entries or existing_tp is None:
+                        placed_any |= self._ensure_take_profit_at(
+                            side='short',
+                            target_price=self.lower_price_short,
+                            quantity=self.short_initial_quantity,
+                            tol_ratio=max(self.grid_spacing * 0.2, 0.001),
+                        )
+                    elif existing_tp:
+                        logger.info("Short take-profit already exists; market guard keeps it unchanged")
 
-                    open_qty = max(self.min_order_amount, round(self.initial_quantity, self.amount_precision))
-                    if self._place_order('sell', self.upper_price_short, open_qty, False, 'short'):
-                        placed_any = True
-                    logger.info("Placed short take-profit and short entry orders")
+                    if allow_new_entries:
+                        placed_any |= self._ensure_entry_order_at(
+                            side='short',
+                            target_price=self.upper_price_short,
+                            quantity=self.initial_quantity,
+                            tol_ratio=max(self.grid_spacing * 0.2, 0.001),
+                        )
+                        if placed_any:
+                            logger.info("Placed short take-profit and short entry orders")
+                    else:
+                        logger.info("Short new entries are paused by the market guard; keeping take-profit orders only")
 
                 # 若本轮确实有挂出新单/重挂，则更新冷却时间戳
                 if placed_any:
@@ -1423,6 +1965,23 @@ Please check the bot status...
         self._record_price(self.latest_price)
 
         self._reset_emg_daily_counter_if_new_day()
+        allow_new_entries = self._can_open_new_entries()
+        guard_block_active = not allow_new_entries
+
+        if guard_block_active:
+            cleanup_due_to_dynamic_guard = self._market_guard_paused and self._market_guard_last_cleanup_ts < self._market_guard_last_transition_ts
+            cleanup_due_to_static_guard = self._market_guard_static_block and self._market_guard_last_cleanup_ts < self._market_guard_static_block_ts
+            if cleanup_due_to_dynamic_guard or cleanup_due_to_static_guard:
+                guard_reason = self._market_guard_reason or self._market_guard_static_reason or "market_guard"
+                logger.info(f"Market guard active ({guard_reason}); cancelling non-reduce-only entry orders and keeping reduce-only exits")
+                try:
+                    self._cancel_open_orders_for_side('long')
+                    self._cancel_open_orders_for_side('short')
+                except Exception as e:
+                    logger.warning(f"Failed to cancel entry orders during market-guard pause: {e}")
+                self.long_entry_pending = False
+                self.short_entry_pending = False
+                self._market_guard_last_cleanup_ts = time.time()
 
         # 暂停窗口或封盘：不再开新网格/初始化
         if time.time() < self._grid_pause_until_ts or self._day_fuse_on:
@@ -1437,32 +1996,54 @@ Please check the bot status...
             return
 
         current_time = time.time()
+        guard_reason = self._market_guard_reason or self._market_guard_static_reason or "market_guard"
         
         # 检测多头持仓
         if self.long_position == 0:
-            logger.info(f"No long position detected ({self.long_position}); initializing long orders @ ticker")
-            await self._initialize_long_orders()
+            if self.long_entry_pending:
+                remaining = max(0.0, self.entry_pending_timeout_s - (current_time - self.last_long_order_time))
+                self._log_pending_entry_status('long', remaining)
+            elif not allow_new_entries:
+                if current_time - self._market_guard_last_log_ts >= 15:
+                    self._market_guard_last_log_ts = current_time
+                    logger.info(f"No long position detected ({self.long_position}); new entries paused by {guard_reason}")
+            else:
+                now = time.time()
+                if now - getattr(self, '_last_no_position_log_ts', 0.0) >= 15:
+                    self._last_no_position_log_ts = now
+                    logger.info(f"No long position detected ({self.long_position}); initializing long orders @ ticker")
+                await self._initialize_long_orders()
         else:
             if not (0 < self.buy_long_orders <= self.long_initial_quantity) or not (0 < self.sell_long_orders <= self.long_initial_quantity):
                 if self.long_position > self.position_threshold and current_time - self.last_long_order_time < ORDER_COOLDOWN_TIME:
                     logger.info(f"Less than {ORDER_COOLDOWN_TIME}s since the last long take-profit order; skipping this cycle @ ticker")
                 else:
-                    await self._place_long_orders(self.latest_price)
+                    await self._place_long_orders(self.latest_price, allow_new_entries=allow_new_entries)
 
         # 检测空头持仓
         if self.short_position == 0:
-            await self._initialize_short_orders()
+            if self.short_entry_pending:
+                remaining = max(0.0, self.entry_pending_timeout_s - (current_time - self.last_short_order_time))
+                self._log_pending_entry_status('short', remaining)
+            elif not allow_new_entries:
+                if current_time - self._market_guard_last_log_ts >= 15:
+                    self._market_guard_last_log_ts = current_time
+                    logger.info(f"No short position detected ({self.short_position}); new entries paused by {guard_reason}")
+            else:
+                await self._initialize_short_orders()
         else:
             if not (0 < self.sell_short_orders <= self.short_initial_quantity) or not (0 < self.buy_short_orders <= self.short_initial_quantity):
                 if self.short_position > self.position_threshold and current_time - self.last_short_order_time < ORDER_COOLDOWN_TIME:
                     logger.info(f"Less than {ORDER_COOLDOWN_TIME}s since the last short take-profit order; skipping this cycle @ ticker")
                 else:
-                    await self._place_short_orders(self.latest_price)
+                    await self._place_short_orders(self.latest_price, allow_new_entries=allow_new_entries)
 
     # ===== 新增：只撤"开仓"挂单，保留 reduceOnly 的止盈挂单 =====
     def _cancel_open_orders_for_side(self, position_side: str):
         """仅撤销某个方向的开仓挂单（reduceOnly=False），保留止盈单"""
-        orders = self.exchange.fetch_open_orders(self.ccxt_symbol)
+        orders = self._safe_fetch_open_orders(self.ccxt_symbol)
+        if orders is None:
+            return False
         try:
             for order in orders:
                 side = order.get('side')  # 'buy' / 'sell'
@@ -1485,6 +2066,7 @@ Please check the bot status...
             self._check_orders_status()
         except Exception as e:
             logger.error(f"Failed to cancel entry orders: {e}")
+        return True
 
     # ===== 新增：获取当前方向已有的止盈单（reduceOnly=True）=====
     def _get_existing_tp_order(self, side: str):
@@ -1492,7 +2074,9 @@ Please check the bot status...
         返回该方向当前已存在的一张 reduceOnly 止盈单（若有）。
         side: 'long' or 'short'
         """
-        orders = self.exchange.fetch_open_orders(self.ccxt_symbol)
+        orders = self._safe_fetch_open_orders(self.ccxt_symbol)
+        if orders is None:
+            return None
         for order in orders:
             pos = order.get('info', {}).get('positionSide', 'BOTH')
             s = order.get('side')
@@ -1505,6 +2089,53 @@ Please check the bot status...
             if side == 'short' and pos == 'SHORT' and ro and s == 'buy':
                 return order
         return None
+
+    def _get_existing_entry_order(self, side: str):
+        """Return the current non-reduce-only entry order for a side, if any."""
+        orders = self._safe_fetch_open_orders(self.ccxt_symbol)
+        if orders is None:
+            return None
+        for order in orders:
+            pos = order.get('info', {}).get('positionSide', 'BOTH')
+            s = order.get('side')
+            ro = order.get('reduceOnly')
+            if ro is None:
+                ro = order.get('info', {}).get('reduceOnly') or order.get('info', {}).get('reduce_only') or False
+
+            if side == 'long' and pos == 'LONG' and (not ro) and s == 'buy':
+                return order
+            if side == 'short' and pos == 'SHORT' and (not ro) and s == 'sell':
+                return order
+        return None
+
+    def _ensure_entry_order_at(self, side: str, target_price: float, quantity: float, tol_ratio: float = None) -> bool:
+        """
+        Ensure a fresh entry order exists near the requested price.
+        Returns True when a new order is placed or the previous one is replaced.
+        """
+        if tol_ratio is None:
+            tol_ratio = max(self.grid_spacing * 0.2, 0.001)
+
+        target_price = round(float(target_price), self.price_precision)
+        existing = self._get_existing_entry_order(side)
+        if existing:
+            try:
+                existing_price = round(float(existing['price']), self.price_precision)
+            except Exception:
+                existing_price = None
+
+            if existing_price is not None:
+                rel_diff = abs(existing_price / target_price - 1.0)
+                if rel_diff <= tol_ratio:
+                    return False
+            self._cancel_order(existing['id'])
+
+        if side == 'long':
+            order = self._place_order('buy', target_price, quantity, False, 'long')
+        else:
+            order = self._place_order('sell', target_price, quantity, False, 'short')
+
+        return bool(order)
 
     # ===== 新增：确保止盈单在目标价位（偏离超阈值则重挂），返回是否有下单动作 =====
     def _ensure_take_profit_at(self, side: str, target_price: float, quantity: float, tol_ratio: float = None) -> bool:
@@ -1775,12 +2406,20 @@ Please check the bot status...
             await asyncio.sleep(5)
 
             # 初始化时获取一次挂单状态
-            self._check_orders_status()
+            try:
+                self._check_orders_status()
+            except Exception as e:
+                logger.warning(f"Initial order sync failed; continuing with empty order state: {e}")
             # 仅用本地持久化恢复装死状态（不读取订单、不反推）
-            self._restore_lockdown_from_local()
+            try:
+                self._restore_lockdown_from_local()
+            except Exception as e:
+                logger.warning(f"Initial lockdown restore failed; continuing: {e}")
 
             logger.info(
                 f"Initial order state: long entry={self.buy_long_orders}, long take-profit={self.sell_long_orders}, short entry={self.sell_short_orders}, short take-profit={self.buy_short_orders}")
+
+            self._log_market_guard_startup()
 
             # 发送启动通知
             await self._send_startup_notification()

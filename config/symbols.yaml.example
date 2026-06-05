@@ -29,6 +29,16 @@ symbols:
     contract_type: USDT       # USDT合约
     position_threshold_factor: 20
     position_limit_factor: 10
+    maker_fee_rate: 0.0002
+    taker_fee_rate: 0.0005
+    funding_buffer_rate: 0.0003
+    min_net_edge_rate: 0.0005
+    max_spread_rate: 0.0015
+    range_filter_lookback: 20
+    range_min_samples: 8
+    range_min_pct: 0.0010
+    range_breakout_pct: 0.0150
+    range_pause_seconds: 45
     
   # ETH币种配置示例
   - name: ETH
@@ -38,6 +48,16 @@ symbols:
     contract_type: USDT       # USDT合约
     position_threshold_factor: 20
     position_limit_factor: 10
+    maker_fee_rate: 0.0002
+    taker_fee_rate: 0.0005
+    funding_buffer_rate: 0.0003
+    min_net_edge_rate: 0.0005
+    max_spread_rate: 0.0015
+    range_filter_lookback: 20
+    range_min_samples: 8
+    range_min_pct: 0.0010
+    range_breakout_pct: 0.0150
+    range_pause_seconds: 45
     
   # DOGE币种配置示例
   - name: DOGE
@@ -46,4 +66,29 @@ symbols:
     leverage: 30              # 30倍杠杆
     contract_type: USDC       # USDC合约
     position_threshold_factor: 20
-    position_limit_factor: 10 
+    position_limit_factor: 10
+    maker_fee_rate: 0.0002
+    taker_fee_rate: 0.0005
+    funding_buffer_rate: 0.0003
+    min_net_edge_rate: 0.0005
+    max_spread_rate: 0.0015
+    range_filter_lookback: 20
+    range_min_samples: 8
+    range_min_pct: 0.0010
+    range_breakout_pct: 0.0150
+    range_pause_seconds: 45
+
+# 可选：侧向市场筛选器
+scanner:
+  enabled: false              # true 时先扫描再启动最适合横盘的币种
+  timeframe: 15m
+  lookback: 96
+  top_n: 3
+  min_score: 0.55
+  min_range_pct: 0.0020
+  ideal_range_pct: 0.0120
+  max_range_pct: 0.0500
+  max_direction_pct: 0.0060
+  max_spread_pct: 0.0015
+  min_quote_volume: 0
+  max_funding_abs: 0.0005

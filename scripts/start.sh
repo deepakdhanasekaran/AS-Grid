@@ -108,6 +108,16 @@ start_multi_bot() {
         exit 1
     fi
     
+    # 加载环境变量
+    if [ -f "config/.env" ]; then
+        set -a
+        source config/.env
+        set +a
+    else
+        print_error "config/.env 文件不存在，请先配置环境变量"
+        exit 1
+    fi
+
     # 检查配置文件
     if [ ! -f "config/symbols.yaml" ] && [ ! -f "config/symbols.json" ]; then
         print_error "配置文件不存在，请创建 config/symbols.yaml 或 config/symbols.json"

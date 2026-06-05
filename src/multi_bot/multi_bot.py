@@ -14,9 +14,11 @@ import os
 sys.path.append(os.path.dirname(__file__))
 from binance_multi_bot import BinanceGridBot
 from logging_config import setup_logging, create_bot_logger, DailyStatusLogger
+from sideways_scanner import build_scanner_settings, select_sideways_symbol_configs
 
 # Load environment variables
-load_dotenv()
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+load_dotenv(os.path.join(PROJECT_ROOT, "config", ".env"))
 
 # Global state used to control all bots
 running_bots = {}
@@ -66,6 +68,42 @@ def load_config(config_file='config/symbols.yaml'):
                 symbol_config['leverage'] = 20
             if 'contract_type' not in symbol_config:
                 symbol_config['contract_type'] = 'USDT'
+            if 'maker_fee_rate' not in symbol_config:
+                symbol_config['maker_fee_rate'] = 0.0002
+            if 'taker_fee_rate' not in symbol_config:
+                symbol_config['taker_fee_rate'] = 0.0005
+            if 'funding_buffer_rate' not in symbol_config:
+                symbol_config['funding_buffer_rate'] = 0.0003
+            if 'min_net_edge_rate' not in symbol_config:
+                symbol_config['min_net_edge_rate'] = 0.0010
+            if 'max_spread_rate' not in symbol_config:
+                symbol_config['max_spread_rate'] = 0.0010
+            if 'range_filter_lookback' not in symbol_config:
+                symbol_config['range_filter_lookback'] = 60
+            if 'range_min_samples' not in symbol_config:
+                symbol_config['range_min_samples'] = 20
+            if 'range_min_pct' not in symbol_config:
+                symbol_config['range_min_pct'] = 0.0020
+            if 'range_breakout_pct' not in symbol_config:
+                symbol_config['range_breakout_pct'] = 0.0080
+            if 'range_pause_seconds' not in symbol_config:
+                symbol_config['range_pause_seconds'] = 300
+
+        if 'scanner' not in config or not isinstance(config.get('scanner'), dict):
+            config['scanner'] = {
+                'enabled': False,
+                'timeframe': '15m',
+                'lookback': 96,
+                'top_n': 3,
+                'min_score': 0.55,
+                'min_range_pct': 0.0020,
+                'ideal_range_pct': 0.0120,
+                'max_range_pct': 0.0500,
+                'max_direction_pct': 0.0060,
+                'max_spread_pct': 0.0015,
+                'min_quote_volume': 0.0,
+                'max_funding_abs': 0.0005,
+            }
         
         main_logger.info(f"Configuration file loaded successfully: {config_file}")
         return config
@@ -112,7 +150,17 @@ def run_single_bot(symbol_config, api_key, api_secret):
             'grid_spacing': symbol_config['grid_spacing'],
             'initial_quantity': symbol_config['initial_quantity'],
             'leverage': symbol_config['leverage'],
-            'contract_type': symbol_config['contract_type']
+            'contract_type': symbol_config['contract_type'],
+            'maker_fee_rate': symbol_config['maker_fee_rate'],
+            'taker_fee_rate': symbol_config['taker_fee_rate'],
+            'funding_buffer_rate': symbol_config['funding_buffer_rate'],
+            'min_net_edge_rate': symbol_config['min_net_edge_rate'],
+            'max_spread_rate': symbol_config['max_spread_rate'],
+            'range_filter_lookback': symbol_config['range_filter_lookback'],
+            'range_min_samples': symbol_config['range_min_samples'],
+            'range_min_pct': symbol_config['range_min_pct'],
+            'range_breakout_pct': symbol_config['range_breakout_pct'],
+            'range_pause_seconds': symbol_config['range_pause_seconds'],
         }
         
         logger.info(f"Starting {symbol} grid bot")
@@ -231,6 +279,34 @@ def print_status():
         except KeyboardInterrupt:
             break
 
+def maybe_select_sideways_symbols(config, symbols):
+    """Return a filtered symbol list when the sideways scanner is enabled."""
+    scanner_settings = build_scanner_settings(config)
+    if not scanner_settings.get("enabled", False):
+        return symbols, None
+
+    main_logger.info(
+        "Sideways scanner enabled: timeframe=%s lookback=%s top_n=%s min_score=%.2f",
+        scanner_settings["timeframe"],
+        scanner_settings["lookback"],
+        scanner_settings["top_n"],
+        scanner_settings["min_score"],
+    )
+
+    selected_symbols, ranked_scores = select_sideways_symbol_configs(
+        symbols,
+        settings=scanner_settings,
+        logger=main_logger,
+    )
+
+    if not selected_symbols:
+        main_logger.warning("Sideways scanner produced no selectable symbols; falling back to the configured list")
+        return symbols, ranked_scores
+
+    selected_names = [symbol_config["name"] for symbol_config in selected_symbols]
+    main_logger.info("Sideways scanner selected %s/%s symbols: %s", len(selected_symbols), len(symbols), selected_names)
+    return selected_symbols, ranked_scores
+
 def main():
     """
     Main entry point
@@ -255,6 +331,16 @@ def main():
     
     symbols = config['symbols']
     main_logger.info(f"Configured {len(symbols)} symbol(s): {[s['name'] for s in symbols]}")
+
+    symbols, ranked_scores = maybe_select_sideways_symbols(config, symbols)
+    if ranked_scores is not None:
+        main_logger.info(
+            "Sideways ranking: %s",
+            ", ".join(
+                f"{score.symbol}={score.score:.3f}" for score in ranked_scores[: min(len(ranked_scores), 10)]
+            ) if ranked_scores else "none",
+        )
+        main_logger.info(f"Selected {len(symbols)} symbol(s) after sideways filtering: {[s['name'] for s in symbols]}")
     
     # Start the status monitor thread
     status_thread = threading.Thread(target=print_status, daemon=True)

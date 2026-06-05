@@ -79,8 +79,14 @@ create_directories() {
 }
 
 build_image() {
+    local build_args=()
+    if [ "${1:-}" = "--no-cache" ]; then
+        build_args+=(--no-cache)
+        print_warning "Docker build will run without cache"
+    fi
+
     print_info "构建 Docker 镜像..."
-    docker build -t "${IMAGE_NAME}" -f "${ROOT_DIR}/docker/Dockerfile" "${ROOT_DIR}"
+    docker build "${build_args[@]}" -t "${IMAGE_NAME}" -f "${ROOT_DIR}/docker/Dockerfile" "${ROOT_DIR}"
     print_success "Docker 镜像构建完成"
 }
 
@@ -203,7 +209,7 @@ show_bot_logs() {
 # 主逻辑
 case "${1:-start}" in
     "build")
-        build_image
+        build_image "${2:-}"
         ;;
     "start")
         start_container
@@ -237,6 +243,7 @@ case "${1:-start}" in
         echo ""
         echo "可用命令:"
         echo "  build       - 构建 Docker 镜像"
+        echo "  build --no-cache - 无缓存构建 Docker 镜像"
         echo "  start       - 启动单币种交易机器人 (默认)"
         echo "  multi-start - 启动多币种交易机器人"
         echo "  stop        - 停止交易机器人"

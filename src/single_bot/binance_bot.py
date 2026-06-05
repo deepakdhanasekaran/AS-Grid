@@ -30,6 +30,26 @@ def validate_config():
     leverage = int(os.getenv("LEVERAGE", "20"))
     if leverage <= 0 or leverage > 100:
         raise ValueError("LEVERAGE must be between 1 and 100")
+
+    maker_fee_rate = float(os.getenv("MAKER_FEE_RATE", "0.0002"))
+    taker_fee_rate = float(os.getenv("TAKER_FEE_RATE", "0.0005"))
+    funding_buffer_rate = float(os.getenv("FUNDING_BUFFER_RATE", "0.0003"))
+    min_net_edge_rate = float(os.getenv("MIN_NET_EDGE_RATE", "0.0010"))
+    max_spread_rate = float(os.getenv("MAX_SPREAD_RATE", "0.0010"))
+    range_filter_lookback = int(os.getenv("RANGE_FILTER_LOOKBACK", "60"))
+    range_min_samples = int(os.getenv("RANGE_MIN_SAMPLES", "20"))
+    range_min_pct = float(os.getenv("RANGE_MIN_PCT", "0.0020"))
+    range_breakout_pct = float(os.getenv("RANGE_BREAKOUT_PCT", "0.0080"))
+    range_pause_seconds = int(os.getenv("RANGE_PAUSE_SECONDS", "300"))
+
+    if maker_fee_rate < 0 or taker_fee_rate < 0:
+        raise ValueError("Fee rates must be non-negative")
+    if funding_buffer_rate < 0 or min_net_edge_rate < 0 or max_spread_rate < 0:
+        raise ValueError("Guard buffer rates must be non-negative")
+    if range_filter_lookback <= 0 or range_min_samples <= 0 or range_pause_seconds <= 0:
+        raise ValueError("Range guard timing values must be greater than 0")
+    if range_min_pct <= 0 or range_breakout_pct <= 0:
+        raise ValueError("Range guard thresholds must be greater than 0")
     
     # Validate Telegram configuration
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -62,13 +82,33 @@ async def main():
         grid_spacing = float(os.getenv("GRID_SPACING", "0.001"))
         initial_quantity = float(os.getenv("INITIAL_QUANTITY", "3"))
         leverage = int(os.getenv("LEVERAGE", "20"))
+        maker_fee_rate = float(os.getenv("MAKER_FEE_RATE", "0.0002"))
+        taker_fee_rate = float(os.getenv("TAKER_FEE_RATE", "0.0005"))
+        funding_buffer_rate = float(os.getenv("FUNDING_BUFFER_RATE", "0.0003"))
+        min_net_edge_rate = float(os.getenv("MIN_NET_EDGE_RATE", "0.0010"))
+        max_spread_rate = float(os.getenv("MAX_SPREAD_RATE", "0.0010"))
+        range_filter_lookback = int(os.getenv("RANGE_FILTER_LOOKBACK", "60"))
+        range_min_samples = int(os.getenv("RANGE_MIN_SAMPLES", "20"))
+        range_min_pct = float(os.getenv("RANGE_MIN_PCT", "0.0020"))
+        range_breakout_pct = float(os.getenv("RANGE_BREAKOUT_PCT", "0.0080"))
+        range_pause_seconds = int(os.getenv("RANGE_PAUSE_SECONDS", "300"))
         
         # Build config dictionary
         config = {
             'grid_spacing': grid_spacing,
             'initial_quantity': initial_quantity,
             'leverage': leverage,
-            'contract_type': contract_type
+            'contract_type': contract_type,
+            'maker_fee_rate': maker_fee_rate,
+            'taker_fee_rate': taker_fee_rate,
+            'funding_buffer_rate': funding_buffer_rate,
+            'min_net_edge_rate': min_net_edge_rate,
+            'max_spread_rate': max_spread_rate,
+            'range_filter_lookback': range_filter_lookback,
+            'range_min_samples': range_min_samples,
+            'range_min_pct': range_min_pct,
+            'range_breakout_pct': range_breakout_pct,
+            'range_pause_seconds': range_pause_seconds,
         }
         
         # Build trading pair symbol
