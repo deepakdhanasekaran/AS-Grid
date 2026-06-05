@@ -188,6 +188,7 @@ Thumbs.db
 
 # Docker相关
 .dockerignore
+!docker/.dockerignore
 
 # 备份文件
 *.bak

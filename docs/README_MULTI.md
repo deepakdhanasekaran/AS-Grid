@@ -17,7 +17,7 @@ grid/
 ├── docker/docker-compose.yml # Docker配置
 ├── health_check.py         # 健康检查脚本
 ├── scripts/start.sh         # 启动脚本
-├── .env                    # 环境变量配置
+├── config/.env             # 环境变量配置
 └── log/                    # 日志目录
     ├── multi_grid_BN.log   # 主日志
     ├── status_summary.log  # 状态汇总日志
@@ -33,8 +33,8 @@ grid/
 pip install ccxt websockets python-dotenv pyyaml aiohttp
 
 # 配置环境变量
-cp .env.example .env
-# 编辑 .env 文件，设置 API 密钥等信息
+cp config/env.example config/.env
+# 编辑 config/.env 文件，设置 API 密钥等信息
 ```
 
 ### 2. 配置文件设置
@@ -401,7 +401,7 @@ grep "启动成功" log/multi_grid_BN.log
 ### 常见错误
 
 1. **"API_KEY 和 API_SECRET 必须设置"**
-   - 检查 .env 文件是否存在
+   - 检查 config/.env 文件是否存在
    - 确认 API_KEY 和 API_SECRET 已设置
 
 2. **"配置文件不存在"**
@@ -419,4 +419,4 @@ grep "启动成功" log/multi_grid_BN.log
 
 ---
 
-**注意**: 本软件仅供学习和研究使用，请在使用前充分了解风险，并确保遵守相关法律法规。 
+**注意**: 本软件仅供学习和研究使用，请在使用前充分了解风险，并确保遵守相关法律法规。

@@ -7,10 +7,11 @@
 复制并编辑环境配置文件：
 
 ```bash
-cp env.example .env
+cp config/env.example config/.env
+cp config/symbols.yaml.example config/symbols.yaml  # only needed for multi-bot mode
 ```
 
-编辑 `.env` 文件，设置必要的配置：
+编辑 `config/.env` 文件，设置必要的配置：
 
 ```bash
 # 交易所配置
@@ -40,16 +41,16 @@ NOTIFICATION_INTERVAL=3600
 
 ```bash
 # 构建镜像
-docker-compose -f docker/docker-compose.yml -f docker/docker-compose -f docker/docker-compose.yml.yml build
+docker compose -f docker/docker-compose.yml build
 
 # 运行容器
-docker-compose -f docker/docker-compose.yml -f docker/docker-compose -f docker/docker-compose.yml.yml up -d
+docker compose -f docker/docker-compose.yml up -d
 
 # 查看日志
-docker-compose -f docker/docker-compose.yml logs -f
+docker compose -f docker/docker-compose.yml logs -f
 
 # 停止容器
-docker-compose -f docker/docker-compose.yml down
+docker compose -f docker/docker-compose.yml down
 ```
 
 #### 使用 Docker 命令
@@ -109,7 +110,7 @@ docker stop grid-trader
 
 ```bash
 # 使用 docker-compose -f docker/docker-compose.yml
-docker-compose -f docker/docker-compose.yml logs -f
+docker compose -f docker/docker-compose.yml logs -f
 
 # 使用 docker
 docker logs -f grid-trader
@@ -133,7 +134,7 @@ tail -f log/grid_BN.log
 如果遇到权限问题，可以修改用户ID：
 
 ```bash
-# 在 docker-compose -f docker/docker-compose.yml.yml 中修改
+# 在 docker/docker-compose.yml 中修改
 USER_ID: 1000
 GROUP_ID: 1000
 ```
@@ -168,7 +169,7 @@ docker exec grid-trader ping fapi.binance.com
 
 ### 资源限制
 
-在 `docker-compose -f docker/docker-compose.yml.yml` 中可以调整资源限制：
+在 `docker/docker-compose.yml` 中可以调整资源限制：
 
 ```yaml
 deploy:
@@ -183,4 +184,4 @@ deploy:
 
 ### 日志轮转
 
-Docker 会自动管理日志文件大小，避免磁盘空间不足。 
+Docker 会自动管理日志文件大小，避免磁盘空间不足。

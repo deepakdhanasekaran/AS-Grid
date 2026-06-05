@@ -286,16 +286,16 @@ cd grid-trading-bot
 #### 单币种模式
 ```bash
 # 复制并配置环境文件
-cp config/env.example .env
-nano .env
+cp config/env.example config/.env
+nano config/.env
 ```
 
 #### 多币种模式
 ```bash
 # 配置环境和币种
-cp config/env.example .env
+cp config/env.example config/.env
 cp config/symbols.yaml config/symbols.yaml.backup
-nano .env
+nano config/.env
 nano config/symbols.yaml
 ```
 
@@ -546,7 +546,7 @@ tail -f log/status_summary.log    # 状态汇总
 1. **API连接失败**
    ```bash
    # 检查API配置
-   grep API_KEY .env
+   grep API_KEY config/.env
    
    # 查看错误日志
    ./scripts/deploy.sh logs

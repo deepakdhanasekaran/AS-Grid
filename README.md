@@ -268,16 +268,16 @@ cd grid-trading-bot
 #### Single Currency Mode
 ```bash
 # Copy and configure environment file
-cp config/env.example .env
-nano .env
+cp config/env.example config/.env
+nano config/.env
 ```
 
 #### Multi-Currency Mode
 ```bash
 # Configure environment and symbols
-cp config/env.example .env
+cp config/env.example config/.env
 cp config/symbols.yaml config/symbols.yaml.backup
-nano .env
+nano config/.env
 nano config/symbols.yaml
 ```
 
@@ -527,7 +527,7 @@ tail -f log/status_summary.log    # Status summary
 1. **API Connection Failure**
    ```bash
    # Check API configuration
-   grep API_KEY .env
+   grep API_KEY config/.env
    
    # View error logs
    ./scripts/deploy.sh logs

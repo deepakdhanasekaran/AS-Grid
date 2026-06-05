@@ -6,7 +6,7 @@ from logging.handlers import TimedRotatingFileHandler, RotatingFileHandler
 from collections import defaultdict
 
 class DuplicateFilter(logging.Filter):
-    """去重过滤器，避免重复的日志信息"""
+    """Deduplicates repetitive log messages"""
     
     def __init__(self, name='', max_duplicates=3, timeout=3600):
         super().__init__(name)
@@ -16,26 +16,26 @@ class DuplicateFilter(logging.Filter):
         self.last_log_time = defaultdict(float)
     
     def filter(self, record):
-        # 创建日志消息的唯一标识
+        # Build a unique key for each log message
         message_key = f"{record.levelname}:{record.getMessage()}"
         current_time = time.time()
         
-        # 检查是否超时，如果超时则重置计数
+        # Reset the counter if the message has timed out
         if current_time - self.last_log_time[message_key] > self.timeout:
             self.duplicate_count[message_key] = 0
         
-        # 增加计数
+        # Increment the counter
         self.duplicate_count[message_key] += 1
         self.last_log_time[message_key] = current_time
         
-        # 如果超过最大重复次数，则过滤掉
+        # Filter out messages that exceed the maximum repeat count
         if self.duplicate_count[message_key] > self.max_duplicates:
             return False
         
         return True
 
 class DailyStatusLogger:
-    """每日状态记录器，确保状态信息每天只记录一次"""
+    """Daily status logger that emits state messages once per day"""
     
     def __init__(self, logger, log_file='log/daily_status.log'):
         self.logger = logger
@@ -43,14 +43,14 @@ class DailyStatusLogger:
         self.last_status_date = None
         self.last_status_message = None
         
-        # 确保日志目录存在
+        # Ensure the log directory exists
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
     
     def log_status(self, message):
-        """记录状态信息，每天只记录一次"""
+        """Record status information once per day"""
         current_date = date.today()
         
-        # 如果是新的一天或者消息发生变化，则记录
+        # Log if it is a new day or the message changed
         if (self.last_status_date != current_date or 
             self.last_status_message != message):
             
@@ -59,48 +59,48 @@ class DailyStatusLogger:
             self.last_status_message = message
 
 class ThresholdStateLogger:
-    """阈值状态记录器，只在状态变化时记录"""
+    """Threshold state logger that emits only on state changes"""
     
     def __init__(self, logger):
         self.logger = logger
-        self.threshold_states = {}  # 记录每个币种的阈值状态
+        self.threshold_states = {}  # Track threshold state per symbol
     
     def log_threshold_status(self, symbol, side, position, threshold, is_over_threshold):
-        """记录阈值状态，只在状态变化时记录"""
+        """Record threshold state only when it changes"""
         state_key = f"{symbol}_{side}"
         
-        # 检查状态是否发生变化
+        # Check whether the state changed
         if (state_key not in self.threshold_states or 
             self.threshold_states[state_key] != is_over_threshold):
             
             if is_over_threshold:
-                self.logger.info(f"持仓{position}超过极限阈值 {threshold}，{side} 装死")
+                self.logger.info(f"Position {position} exceeded the limit threshold {threshold}; {side} entering lockdown")
             else:
-                self.logger.info(f"持仓{position}已低于极限阈值 {threshold}，{side} 恢复正常")
+                self.logger.info(f"Position {position} fell below the limit threshold {threshold}; {side} back to normal")
             
             self.threshold_states[state_key] = is_over_threshold
 
 def setup_logging():
-    """设置优化的日志配置"""
+    """Set up optimized logging configuration"""
     
-    # 确保日志目录存在
+    # Ensure the log directory exists
     os.makedirs("log", exist_ok=True)
     
-    # 创建主日志记录器
+    # Create the main logger
     main_logger = logging.getLogger('main')
     main_logger.setLevel(logging.INFO)
     
-    # 清除现有的处理器
+    # Clear existing handlers
     main_logger.handlers.clear()
     
-    # 控制台处理器
+    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_formatter)
     main_logger.addHandler(console_handler)
     
-    # 文件处理器 - 按日期分割，限制文件大小
+    # File handler with daily rotation
     file_handler = TimedRotatingFileHandler(
         'log/multi_grid_BN.log',
         when='midnight',
@@ -112,7 +112,7 @@ def setup_logging():
     file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(file_formatter)
     
-    # 添加去重过滤器
+    # Add deduplication filter
     duplicate_filter = DuplicateFilter(max_duplicates=3, timeout=3600)
     file_handler.addFilter(duplicate_filter)
     
@@ -121,16 +121,16 @@ def setup_logging():
     return main_logger
 
 def create_bot_logger(symbol):
-    """为每个币种创建独立的日志记录器"""
+    """Create a dedicated logger for each symbol"""
     
     logger = logging.getLogger(f'bot_{symbol}')
     logger.setLevel(logging.INFO)
     
-    # 避免重复添加处理器
+    # Avoid adding handlers twice
     if logger.handlers:
         return logger
     
-    # 文件处理器 - 按日期分割，限制文件大小
+    # File handler with daily rotation
     file_handler = TimedRotatingFileHandler(
         f'log/grid_BN_{symbol}.log',
         when='midnight',
@@ -142,7 +142,7 @@ def create_bot_logger(symbol):
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
     
-    # 添加去重过滤器
+    # Add deduplication filter
     duplicate_filter = DuplicateFilter(max_duplicates=3, timeout=3600)
     file_handler.addFilter(duplicate_filter)
     
@@ -151,17 +151,17 @@ def create_bot_logger(symbol):
     return logger
 
 def setup_binance_multi_bot_logging():
-    """设置币安多币种机器人的日志配置"""
+    """Set up logging for the Binance multi-bot"""
     
-    # 检查是否从单币种脚本调用
+    # Detect if the caller is the single-bot script
     import inspect
     import sys
     import os
     
-    # 确保日志目录存在
+    # Ensure the log directory exists
     os.makedirs("log", exist_ok=True)
     
-    # 遍历调用栈，查找调用者
+    # Walk the call stack and find the caller
     log_filename = None
     for frame_info in inspect.stack():
         frame = frame_info.frame
@@ -177,7 +177,7 @@ def setup_binance_multi_bot_logging():
     handlers = [logging.StreamHandler()]
     
     try:
-        # 使用轮转文件处理器替代普通文件处理器
+        # Use a rotating file handler instead of a plain file handler
         file_handler = TimedRotatingFileHandler(
             f"log/{log_filename}",
             when='midnight',
@@ -186,13 +186,13 @@ def setup_binance_multi_bot_logging():
             encoding='utf-8'
         )
         handlers.append(file_handler)
-        print(f"日志将写入文件: log/{log_filename}")
+        print(f"Logs will be written to: log/{log_filename}")
     except PermissionError as e:
-        print(f"警告: 无法创建日志文件 (权限不足): {e}")
-        print("日志将只输出到控制台")
+        print(f"Warning: unable to create log file (permission denied): {e}")
+        print("Logs will be written to the console only")
     except Exception as e:
-        print(f"警告: 无法创建日志文件: {e}")
-        print("日志将只输出到控制台")
+        print(f"Warning: unable to create log file: {e}")
+        print("Logs will be written to the console only")
     
     logging.basicConfig(
         level=logging.INFO,
@@ -202,7 +202,7 @@ def setup_binance_multi_bot_logging():
     
     logger = logging.getLogger()
     
-    # 为文件处理器添加去重过滤器
+    # Add deduplication filters to file handlers
     for handler in handlers:
         if isinstance(handler, TimedRotatingFileHandler):
             duplicate_filter = DuplicateFilter(max_duplicates=3, timeout=3600)
@@ -211,7 +211,7 @@ def setup_binance_multi_bot_logging():
     return logger
 
 def cleanup_old_logs(days=7):
-    """清理旧的日志文件"""
+    """Clean up old log files"""
     import glob
     import os
     from datetime import datetime, timedelta
@@ -219,19 +219,19 @@ def cleanup_old_logs(days=7):
     log_dir = "log"
     cutoff_date = datetime.now() - timedelta(days=days)
     
-    # 查找所有日志文件
+    # Find all log files
     log_patterns = [
-        "*.log.*",  # 轮转的日志文件
-        "*.log.gz",  # 压缩的日志文件
+        "*.log.*",  # Rotated log files
+        "*.log.gz",  # Compressed log files
     ]
     
     for pattern in log_patterns:
         for log_file in glob.glob(os.path.join(log_dir, pattern)):
             try:
-                # 获取文件修改时间
+                # Read the file modification time
                 file_mtime = datetime.fromtimestamp(os.path.getmtime(log_file))
                 if file_mtime < cutoff_date:
                     os.remove(log_file)
-                    print(f"已删除旧日志文件: {log_file}")
+                    print(f"Deleted old log file: {log_file}")
             except Exception as e:
-                print(f"删除日志文件失败 {log_file}: {e}")
+                print(f"Failed to delete log file {log_file}: {e}")

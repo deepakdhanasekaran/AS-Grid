@@ -5,6 +5,29 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+COMPOSE_FILE="${ROOT_DIR}/docker/docker-compose.yml"
+ENV_FILE="${ROOT_DIR}/config/.env"
+ENV_EXAMPLE="${ROOT_DIR}/config/env.example"
+SYMBOLS_YAML="${ROOT_DIR}/config/symbols.yaml"
+SYMBOLS_YAML_EXAMPLE="${ROOT_DIR}/config/symbols.yaml.example"
+SYMBOLS_JSON="${ROOT_DIR}/config/symbols.json"
+SYMBOLS_JSON_EXAMPLE="${ROOT_DIR}/config/symbols.json.example"
+
+compose() {
+    local env_args=()
+    if [ -f "${ENV_FILE}" ]; then
+        env_args=(--env-file "${ENV_FILE}")
+    fi
+
+    if docker compose version >/dev/null 2>&1; then
+        docker compose -f "${COMPOSE_FILE}" "${env_args[@]}" "$@"
+    else
+        docker-compose -f "${COMPOSE_FILE}" "${env_args[@]}" "$@"
+    fi
+}
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -35,10 +58,10 @@ print_error() {
 }
 
 check_env_file() {
-    if [ ! -f "config/.env" ]; then
+    if [ ! -f "${ENV_FILE}" ]; then
         print_warning ".env 文件不存在，正在从示例文件创建..."
-        if [ -f "config/env.example" ]; then
-            cp config/env.example .env
+        if [ -f "${ENV_EXAMPLE}" ]; then
+            cp "${ENV_EXAMPLE}" "${ENV_FILE}"
             print_info "请编辑 .env 文件并设置你的 API 密钥"
             return 1
         else
@@ -51,13 +74,13 @@ check_env_file() {
 
 create_directories() {
     print_info "创建必要的目录..."
-    mkdir -p log
-    mkdir -p src/multi_bot/state
+    mkdir -p "${ROOT_DIR}/log"
+    mkdir -p "${ROOT_DIR}/src/multi_bot/state"
 }
 
 build_image() {
     print_info "构建 Docker 镜像..."
-    docker build -t $IMAGE_NAME -f docker/Dockerfile .
+    docker build -t "${IMAGE_NAME}" -f "${ROOT_DIR}/docker/Dockerfile" "${ROOT_DIR}"
     print_success "Docker 镜像构建完成"
 }
 
@@ -69,55 +92,50 @@ start_container() {
     
     create_directories
     
-    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
-        print_warning "容器已在运行，正在重启..."
-        docker-compose -f docker/docker-compose.yml --env-file config/.env restart
-    else
-        print_info "启动网格交易机器人..."
-        docker-compose -f docker/docker-compose.yml --env-file config/.env up -d
-    fi
-    
+    print_info "启动网格交易机器人..."
+    compose up -d --build
+
     print_success "网格交易机器人已启动"
     print_info "使用 './deploy.sh logs' 查看日志"
 }
 
 stop_container() {
     print_info "停止网格交易机器人..."
-    docker-compose -f docker/docker-compose.yml --env-file config/.env down
+    compose down
     print_success "网格交易机器人已停止"
 }
 
 restart_container() {
     print_info "重启网格交易机器人..."
-    docker-compose -f docker/docker-compose.yml --env-file config/.env restart
+    compose up -d --build
     print_success "网格交易机器人已重启"
 }
 
 show_logs() {
     print_info "显示容器日志..."
     if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
-        docker logs -f --tail=100 $CONTAINER_NAME
+        docker logs -f --tail=100 "${CONTAINER_NAME}"
     else
         print_warning "容器未运行"
-        docker-compose -f docker/docker-compose.yml --env-file config/.env logs -f --tail=100
+        compose logs -f --tail=100
     fi
 }
 
 show_status() {
     print_info "容器状态:"
     if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
-        docker ps --filter name=$CONTAINER_NAME --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+        docker ps --filter name="${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
     else
-        docker-compose -f docker/docker-compose.yml --env-file config/.env ps
+        compose ps
     fi
     echo
     
     if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
         print_info "容器健康状态:"
-        docker inspect --format='{{.State.Health.Status}}' $CONTAINER_NAME 2>/dev/null || echo "无健康检查信息"
+        docker inspect --format='{{.State.Health.Status}}' "${CONTAINER_NAME}" 2>/dev/null || echo "无健康检查信息"
         
         print_info "资源使用情况:"
-        docker stats $CONTAINER_NAME --no-stream --format "table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}"
+        docker stats "${CONTAINER_NAME}" --no-stream --format "table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}"
     fi
 }
 
@@ -135,22 +153,24 @@ start_multi_container() {
     fi
     
     # 检查配置文件
-    if [ ! -f "config/symbols.yaml" ] && [ ! -f "config/symbols.json" ]; then
-        print_error "配置文件不存在，请创建 config/symbols.yaml 或 config/symbols.json"
-        exit 1
+    if [ ! -f "${SYMBOLS_YAML}" ] && [ ! -f "${SYMBOLS_JSON}" ]; then
+        if [ -f "${SYMBOLS_YAML_EXAMPLE}" ]; then
+            print_warning "未找到多币种配置，正在从示例文件创建 config/symbols.yaml..."
+            cp "${SYMBOLS_YAML_EXAMPLE}" "${SYMBOLS_YAML}"
+        elif [ -f "${SYMBOLS_JSON_EXAMPLE}" ]; then
+            print_warning "未找到多币种配置，正在从示例文件创建 config/symbols.json..."
+            cp "${SYMBOLS_JSON_EXAMPLE}" "${SYMBOLS_JSON}"
+        else
+            print_error "配置文件不存在，请创建 config/symbols.yaml 或 config/symbols.json"
+            exit 1
+        fi
     fi
     
     create_directories
     
-    if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
-        print_warning "容器已在运行，正在重启..."
-        docker-compose -f docker/docker-compose.yml --env-file config/.env restart
-    else
-        print_info "启动多币种网格交易机器人..."
-        # 设置环境变量指示使用多币种模式
-        export GRID_MODE="multi"
-        docker-compose -f docker/docker-compose.yml --env-file config/.env up -d
-    fi
+    print_info "启动多币种网格交易机器人..."
+    export GRID_MODE="multi"
+    compose up -d --build
     
     print_success "多币种网格交易机器人已启动"
     print_info "使用 './deploy.sh multi-logs' 查看汇总日志"
@@ -158,9 +178,9 @@ start_multi_container() {
 
 show_multi_logs() {
     print_info "显示多币种汇总日志..."
-    if [ -f "log/status_summary.log" ]; then
+    if [ -f "${ROOT_DIR}/log/status_summary.log" ]; then
         echo "=== 状态汇总日志 ==="
-        tail -f log/status_summary.log
+        tail -f "${ROOT_DIR}/log/status_summary.log"
     else
         print_warning "状态汇总日志文件不存在"
         show_logs
@@ -169,9 +189,9 @@ show_multi_logs() {
 
 show_bot_logs() {
     print_info "显示币种详细日志..."
-    if [ -d "log" ]; then
+    if [ -d "${ROOT_DIR}/log" ]; then
         echo "可用的币种日志文件:"
-        ls -la log/grid_BN_*.log 2>/dev/null || echo "暂无币种日志文件"
+        ls -la "${ROOT_DIR}"/log/grid_BN_*.log 2>/dev/null || echo "暂无币种日志文件"
         echo ""
         echo "查看特定币种日志: tail -f log/grid_BN_[币种].log"
         echo "例如: tail -f log/grid_BN_BTCUSDT.log"
@@ -233,4 +253,4 @@ case "${1:-start}" in
         print_info "使用 '$0 help' 查看可用命令"
         exit 1
         ;;
-esac 
+esac
